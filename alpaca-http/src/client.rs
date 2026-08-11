@@ -273,7 +273,11 @@ impl AlpacaHttpClient {
     /// Build the full URL for a request
     fn build_url(&self, path: &str) -> Result<String> {
         // Use data URL for market data endpoints
-        let base_url = if path.starts_with("/v2/stocks") || path.starts_with("/v1beta1/crypto") {
+        let base_url = if path.starts_with("/v2/stocks")
+            || path.starts_with("/v1beta1/")
+            || path.starts_with("/v1beta2/")
+            || path.starts_with("/v1beta3/")
+        {
             &self.data_url
         } else {
             &self.base_url

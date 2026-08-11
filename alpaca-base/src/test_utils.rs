@@ -227,13 +227,20 @@ pub mod json_samples {
     /// Sample account JSON response.
     pub const ACCOUNT_JSON: &str = r#"{
         "id": "904837e3-3b76-47ec-b432-046db621571b",
+        "admin_configurations": {},
         "account_number": "PA1234567890",
         "status": "ACTIVE",
+        "crypto_status": "ACTIVE",
+        "options_approved_level": 3,
+        "options_trading_level": 3,
         "currency": "USD",
         "buying_power": "100000.00",
         "regt_buying_power": "100000.00",
-        "daytrading_buying_power": "400000.00",
+        "effective_buying_power": "100000.00",
+        "non_marginable_buying_power": "50000.00",
+        "options_buying_power": "50000.00",
         "cash": "100000.00",
+        "accrued_fees": "0.00",
         "portfolio_value": "100000.00",
         "pattern_day_trader": false,
         "trading_blocked": false,
@@ -247,10 +254,15 @@ pub mod json_samples {
         "last_equity": "99500.00",
         "long_market_value": "0.00",
         "short_market_value": "0.00",
+        "position_market_value": "0.00",
         "initial_margin": "0.00",
         "maintenance_margin": "0.00",
         "last_maintenance_margin": "0.00",
         "sma": "0.00",
+        "balance_asof": "2021-01-01",
+        "crypto_tier": 1,
+        "intraday_adjustments": "0",
+        "pending_reg_taf_fees": "0",
         "daytrade_count": 0
     }"#;
 
