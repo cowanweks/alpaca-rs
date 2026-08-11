@@ -23,7 +23,7 @@ fn main() {
         println!("  Account Number: {}", account.account_number);
         println!("  Status: {:?}", account.status);
         println!("  Buying Power: ${}", account.buying_power);
-        println!("  Pattern Day Trader: {}", account.pattern_day_trader);
+        println!("  Pattern Day Trader: {:?}", account.pattern_day_trader);
 
         // 2. Sample Asset
         println!("\n--- Sample Asset ---");
