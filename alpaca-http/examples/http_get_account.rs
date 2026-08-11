@@ -33,25 +33,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Account Number: {}", account.account_number);
             println!("  Status: {:?}", account.status);
             println!("  Currency: {}", account.currency);
+            println!("  Crypto Status: {}", account.crypto_status);
             println!();
             println!("--- Balances ---");
             println!("  Cash: ${}", account.cash);
             println!("  Portfolio Value: ${}", account.portfolio_value);
             println!("  Buying Power: ${}", account.buying_power);
             println!("  Equity: ${}", account.equity);
+            println!("  Last Equity: ${}", account.last_equity);
             println!();
             println!("--- Margin ---");
             println!("  RegT Buying Power: ${}", account.regt_buying_power);
             println!(
-                "  Daytrading Buying Power: ${}",
-                account.daytrading_buying_power
+                "  Effective Buying Power: ${}",
+                account.effective_buying_power
             );
+            println!(
+                "  Non-Marginable Buying Power: ${}",
+                account.non_marginable_buying_power
+            );
+            println!("  Options Buying Power: ${}", account.options_buying_power);
             println!("  Initial Margin: ${}", account.initial_margin);
             println!("  Maintenance Margin: ${}", account.maintenance_margin);
+            println!("  SMA: ${}", account.sma);
+            println!();
+            println!("--- Options ---");
+            println!(
+                "  Options Approved Level: {}",
+                account.options_approved_level
+            );
+            println!("  Options Trading Level: {}", account.options_trading_level);
             println!();
             println!("--- Trading Status ---");
-            println!("  Pattern Day Trader: {}", account.pattern_day_trader);
-            println!("  Day Trade Count: {}", account.daytrade_count);
+            println!(
+                "  Pattern Day Trader: {}",
+                account
+                    .pattern_day_trader
+                    .map_or("N/A".to_string(), |v| v.to_string())
+            );
+            println!(
+                "  Day Trade Count: {}",
+                account
+                    .daytrade_count
+                    .map_or("N/A".to_string(), |v| v.to_string())
+            );
             println!("  Trading Blocked: {}", account.trading_blocked);
             println!("  Account Blocked: {}", account.account_blocked);
             println!("  Shorting Enabled: {}", account.shorting_enabled);
@@ -59,6 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("--- Market Values ---");
             println!("  Long Market Value: ${}", account.long_market_value);
             println!("  Short Market Value: ${}", account.short_market_value);
+            println!(
+                "  Position Market Value: ${}",
+                account.position_market_value
+            );
         }
         Err(e) => {
             eprintln!("Error fetching account: {}", e);
