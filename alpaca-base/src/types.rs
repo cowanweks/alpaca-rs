@@ -4,8 +4,9 @@
 
 #![allow(missing_docs)]
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 /// Trading environment for Alpaca API.
@@ -48,24 +49,38 @@ impl Environment {
 pub struct Account {
     /// Unique account identifier.
     pub id: Uuid,
+    /// Admin-level configuration overrides (opaque JSON object).
+    pub admin_configurations: Value,
+    /// User-level configuration overrides, if any.
+    pub user_configurations: Option<Value>,
     /// Account number.
     pub account_number: String,
     /// Current account status.
     pub status: AccountStatus,
+    /// Crypto trading status.
+    pub crypto_status: String,
+    /// Approved options trading level.
+    pub options_approved_level: i32,
+    /// Current options trading level.
+    pub options_trading_level: i32,
     /// Account currency (e.g., "USD").
     pub currency: String,
     /// Current buying power in dollars.
     pub buying_power: String,
     /// Regulation T buying power.
     pub regt_buying_power: String,
-    /// Day trading buying power.
-    pub daytrading_buying_power: String,
+    /// Effective buying power in dollars.
+    pub effective_buying_power: String,
+    /// Non-marginable buying power in dollars.
+    pub non_marginable_buying_power: String,
+    /// Options buying power in dollars.
+    pub options_buying_power: String,
     /// Cash balance in dollars.
     pub cash: String,
+    /// Accrued fees in dollars.
+    pub accrued_fees: String,
     /// Total portfolio value in dollars.
     pub portfolio_value: String,
-    /// Whether account is flagged as pattern day trader.
-    pub pattern_day_trader: bool,
     /// Whether trading is blocked.
     pub trading_blocked: bool,
     /// Whether transfers are blocked.
@@ -88,6 +103,8 @@ pub struct Account {
     pub long_market_value: String,
     /// Short positions market value in dollars.
     pub short_market_value: String,
+    /// Total position market value in dollars.
+    pub position_market_value: String,
     /// Initial margin requirement in dollars.
     pub initial_margin: String,
     /// Maintenance margin requirement in dollars.
@@ -96,8 +113,20 @@ pub struct Account {
     pub last_maintenance_margin: String,
     /// Special memorandum account value.
     pub sma: String,
-    /// Number of day trades in the last 5 trading days.
-    pub daytrade_count: i32,
+    /// Date the balance figures are as of.
+    pub balance_asof: NaiveDate,
+    /// Crypto account tier.
+    pub crypto_tier: i32,
+    /// Intraday adjustments in dollars.
+    pub intraday_adjustments: String,
+    /// Pending regulatory TAF fees in dollars.
+    pub pending_reg_taf_fees: String,
+    /// Whether account is flagged as pattern day trader (not always present).
+    #[serde(default)]
+    pub pattern_day_trader: Option<bool>,
+    /// Number of day trades in the last 5 trading days (not always present).
+    #[serde(default)]
+    pub daytrade_count: Option<i32>,
 }
 
 /// Account status.
