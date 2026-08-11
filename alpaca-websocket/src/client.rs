@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use crate::{messages::*, streams::*};
+use crate::{config::WebSocketConfig, messages::*, streams::*};
 use alpaca_base::types::Quote;
 use alpaca_base::{AlpacaError, Result, auth::Credentials, types::Environment};
 use futures_util::{
@@ -10,12 +10,14 @@ use futures_util::{
     stream::{SplitSink, SplitStream, StreamExt},
 };
 use serde_json;
+use std::future::Future;
 use std::sync::Once;
 use std::time::Duration;
 use tokio::{
     net::TcpStream,
     sync::mpsc,
-    time::{interval, sleep},
+    sync::mpsc::error::TrySendError,
+    time::{interval, sleep, timeout},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -49,6 +51,12 @@ pub enum DataFeed {
     Iex,
     /// SIP data (paid, real-time)
     Sip,
+    /// 15-minute delayed SIP data
+    DelayedSip,
+    /// BOATS (Blue Ocean ATS) overnight trading data
+    Boats,
+    /// Derived Alpaca overnight feed
+    Overnight,
     /// Crypto data
     Crypto,
 }
@@ -79,6 +87,9 @@ impl AlpacaWebSocketClient {
         let url = match feed {
             DataFeed::Iex => "wss://stream.data.alpaca.markets/v2/iex",
             DataFeed::Sip => "wss://stream.data.alpaca.markets/v2/sip",
+            DataFeed::DelayedSip => "wss://stream.data.alpaca.markets/v2/delayed_sip",
+            DataFeed::Boats => "wss://stream.data.alpaca.markets/v1beta1/boats",
+            DataFeed::Overnight => "wss://stream.data.alpaca.markets/v1beta1/overnight",
             DataFeed::Crypto => "wss://stream.data.alpaca.markets/v1beta3/crypto/us",
         };
 
@@ -107,6 +118,22 @@ impl AlpacaWebSocketClient {
             credentials,
             environment,
             url: url.to_string(),
+        }
+    }
+
+    /// Create a WebSocket client for an arbitrary stream URL.
+    ///
+    /// Useful for proxies or test servers; prefer [`Self::new`],
+    /// [`Self::with_feed`], or [`Self::trading`] for the standard endpoints.
+    pub fn with_url(
+        credentials: Credentials,
+        environment: Environment,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            credentials,
+            environment,
+            url: url.into(),
         }
     }
 
@@ -164,189 +191,143 @@ impl AlpacaWebSocketClient {
         }
     }
 
-    /// Subscribe to market data
+    /// Subscribe to market data with the default [`WebSocketConfig`].
+    ///
+    /// See [`Self::subscribe_market_data_with_config`] for connection
+    /// ownership and lifecycle semantics.
     pub async fn subscribe_market_data(
         &self,
         subscription: SubscribeMessage,
     ) -> Result<MarketDataStream> {
+        self.subscribe_market_data_with_config(subscription, WebSocketConfig::default())
+            .await
+    }
+
+    /// Subscribe to market data with an explicit [`WebSocketConfig`].
+    ///
+    /// # Connection ownership and lifecycle
+    ///
+    /// The returned [`MarketDataStream`] is backed by a background task that
+    /// owns the WebSocket connection:
+    ///
+    /// - The initial connection, authentication, and subscription happen
+    ///   before this method returns; failures are returned as `Err`.
+    /// - After a successful start, if the connection closes or errors the
+    ///   task reconnects with capped exponential backoff
+    ///   (`reconnect_base_delay_ms * 2^(attempt - 1)`, capped at
+    ///   `reconnect_max_delay_ms`) and re-issues the active subscription
+    ///   set. Progress is reported via [`MarketDataEvent::Reconnecting`]
+    ///   and [`MarketDataEvent::Reconnected`].
+    /// - When reconnection is disabled or `reconnect_max_attempts`
+    ///   consecutive attempts fail, a final
+    ///   [`MarketDataEvent::Disconnected`] is emitted and the stream ends.
+    /// - Events are delivered over a bounded channel of
+    ///   `message_buffer_size` entries. If the consumer falls behind, data
+    ///   updates are dropped and reported via [`MarketDataEvent::Lagged`];
+    ///   lifecycle events are never dropped.
+    /// - Dropping the stream stops the background task and closes the
+    ///   connection.
+    pub async fn subscribe_market_data_with_config(
+        &self,
+        subscription: SubscribeMessage,
+        config: WebSocketConfig,
+    ) -> Result<MarketDataStream> {
         // Initialize crypto provider for TLS
         init_crypto_provider();
 
-        let (sender, receiver) = mpsc::unbounded_channel();
-        info!("Connecting to WebSocket: {}", self.url);
-        let (ws_stream, _) = connect_async(&self.url).await?;
-        let (mut sink, mut stream) = ws_stream.split();
-
-        // Wait for "connected" message from server
-        if let Some(Ok(Message::Text(text))) = stream.next().await {
-            debug!("Server: {}", text);
-        }
-
-        // Authenticate
-        self.authenticate(&mut sink).await?;
-
-        // Wait for authentication response
-        if let Some(Ok(Message::Text(text))) = stream.next().await {
-            debug!("Auth response: {}", text);
-        }
-
-        // Send subscription message - Alpaca uses {"action": "subscribe", ...}
-        let sub_msg = serde_json::json!({
-            "action": "subscribe",
-            "trades": subscription.trades.unwrap_or_default(),
-            "quotes": subscription.quotes.unwrap_or_default(),
-            "bars": subscription.bars.unwrap_or_default()
-        });
-        let sub_json = serde_json::to_string(&sub_msg)?;
-        debug!("Sending subscription: {}", sub_json);
-        sink.send(Message::Text(sub_json.into())).await?;
-
-        // Wait for subscription confirmation
-        if let Some(Ok(Message::Text(text))) = stream.next().await {
-            debug!("Subscription response: {}", text);
-        }
-
-        // Spawn message handler that converts to MarketDataUpdate
+        let url = self.url.clone();
         let credentials = self.credentials.clone();
-        tokio::spawn(async move {
-            let _ = credentials; // Keep credentials alive if needed
-            debug!("Handler started, waiting for messages...");
-            while let Some(message) = stream.next().await {
-                match message {
-                    Ok(Message::Text(text)) => {
-                        // Parse array of messages (Alpaca sends arrays)
-                        if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
-                        {
-                            for msg_value in messages {
-                                if let Some(msg_type) = msg_value.get("T").and_then(|t| t.as_str())
-                                {
-                                    let update = match msg_type {
-                                        "t" => {
-                                            // Trade message
-                                            if let Ok(trade_msg) =
-                                                serde_json::from_value::<TradeMessage>(
-                                                    msg_value.clone(),
-                                                )
-                                            {
-                                                Some(MarketDataUpdate::Trade {
-                                                    symbol: trade_msg.symbol.clone(),
-                                                    trade: trade_msg.into(),
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        "q" => {
-                                            // Quote message - try crypto format first
-                                            if let Ok(quote_msg) =
-                                                serde_json::from_value::<CryptoQuoteMessage>(
-                                                    msg_value.clone(),
-                                                )
-                                            {
-                                                Some(MarketDataUpdate::Quote {
-                                                    symbol: quote_msg.symbol.clone(),
-                                                    quote: Quote {
-                                                        timestamp: quote_msg.timestamp,
-                                                        timeframe: "real-time".to_string(),
-                                                        bid_price: quote_msg.bid_price,
-                                                        bid_size: quote_msg.bid_size as u32,
-                                                        ask_price: quote_msg.ask_price,
-                                                        ask_size: quote_msg.ask_size as u32,
-                                                        bid_exchange: String::new(),
-                                                        ask_exchange: String::new(),
-                                                    },
-                                                })
-                                            } else if let Ok(quote_msg) =
-                                                serde_json::from_value::<QuoteMessage>(
-                                                    msg_value.clone(),
-                                                )
-                                            {
-                                                Some(MarketDataUpdate::Quote {
-                                                    symbol: quote_msg.symbol.clone(),
-                                                    quote: quote_msg.into(),
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        "b" => {
-                                            // Bar message
-                                            if let Ok(bar_msg) = serde_json::from_value::<BarMessage>(
-                                                msg_value.clone(),
-                                            ) {
-                                                Some(MarketDataUpdate::Bar {
-                                                    symbol: bar_msg.symbol.clone(),
-                                                    bar: bar_msg.into(),
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        _ => {
-                                            debug!("Ignoring message type: {}", msg_type);
-                                            None
-                                        }
-                                    };
+        let stream = open_market_data_stream(&url, &credentials, &subscription, &config).await?;
 
-                                    if let Some(u) = update
-                                        && sender.send(u).is_err()
-                                    {
-                                        debug!("Channel closed");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => {
-                        info!("WebSocket connection closed");
-                        break;
-                    }
-                    Err(e) => {
-                        error!("WebSocket error: {}", e);
-                        break;
-                    }
-                    _ => {}
-                }
+        let (sender, receiver) = mpsc::channel(config.message_buffer_size.max(1));
+        let open = {
+            let (url, credentials, subscription, config) =
+                (url, credentials, subscription, config.clone());
+            move || {
+                let (url, credentials, subscription, config) = (
+                    url.clone(),
+                    credentials.clone(),
+                    subscription.clone(),
+                    config.clone(),
+                );
+                async move { open_market_data_stream(&url, &credentials, &subscription, &config).await }
             }
-            info!("Market data handler exiting");
-        });
+        };
+        tokio::spawn(run_stream_task(
+            stream,
+            open,
+            |text| {
+                parse_market_data_updates(text)
+                    .into_iter()
+                    .map(MarketDataEvent::Update)
+                    .collect()
+            },
+            config,
+            sender,
+        ));
 
         Ok(MarketDataStream::new(receiver))
     }
 
-    /// Subscribe to trading updates
+    /// Subscribe to trading updates with the default [`WebSocketConfig`].
+    ///
+    /// See [`Self::subscribe_trading_updates_with_config`] for connection
+    /// ownership and lifecycle semantics.
     pub async fn subscribe_trading_updates(&self) -> Result<TradingStream> {
-        let stream = self.connect().await?;
-        let (sender, receiver) = mpsc::unbounded_channel();
+        self.subscribe_trading_updates_with_config(WebSocketConfig::default())
+            .await
+    }
 
-        tokio::spawn(async move {
-            let mut trading_stream = stream.trading_updates();
-            while let Some(update) = trading_stream.next().await {
-                if sender.send(update).is_err() {
-                    break;
-                }
+    /// Subscribe to trading updates with an explicit [`WebSocketConfig`].
+    ///
+    /// # Connection ownership and lifecycle
+    ///
+    /// Same semantics as [`Self::subscribe_market_data_with_config`]: the
+    /// returned [`TradingStream`] is backed by a background task that owns
+    /// the WebSocket connection, reconnects with capped exponential backoff
+    /// (re-authenticating on each attempt), delivers events over a bounded
+    /// channel of `message_buffer_size` entries reporting drops via
+    /// [`TradingEvent::Lagged`], and emits a final
+    /// [`TradingEvent::Disconnected`] before the stream ends. Dropping the
+    /// stream stops the task and closes the connection.
+    pub async fn subscribe_trading_updates_with_config(
+        &self,
+        config: WebSocketConfig,
+    ) -> Result<TradingStream> {
+        // Initialize crypto provider for TLS
+        init_crypto_provider();
+
+        let url = self.url.clone();
+        let credentials = self.credentials.clone();
+        let stream = open_trading_stream(&url, &credentials, &config).await?;
+
+        let (sender, receiver) = mpsc::channel(config.message_buffer_size.max(1));
+        let open = {
+            let (url, credentials, config) = (url, credentials, config.clone());
+            move || {
+                let (url, credentials, config) = (url.clone(), credentials.clone(), config.clone());
+                async move { open_trading_stream(&url, &credentials, &config).await }
             }
-        });
+        };
+        tokio::spawn(run_stream_task(
+            stream,
+            open,
+            |text| {
+                parse_trading_updates(text)
+                    .into_iter()
+                    .map(|update| TradingEvent::Update(Box::new(update)))
+                    .collect()
+            },
+            config,
+            sender,
+        ));
 
         Ok(TradingStream::new(receiver))
     }
 
     /// Authenticate with the WebSocket
     async fn authenticate(&self, sink: &mut WsSink) -> Result<()> {
-        // Alpaca uses {"action": "auth", "key": "...", "secret": "..."}
-        let auth_msg = serde_json::json!({
-            "action": "auth",
-            "key": self.credentials.api_key,
-            "secret": self.credentials.secret_key
-        });
-
-        let auth_json = serde_json::to_string(&auth_msg)?;
-        debug!("Sending auth: {}", auth_json);
-        sink.send(Message::Text(auth_json.into())).await?;
-
-        debug!("Sent authentication message");
-        Ok(())
+        send_auth(&self.credentials, sink).await
     }
 
     /// Handle incoming WebSocket messages
@@ -438,6 +419,436 @@ impl AlpacaWebSocketClient {
     }
 }
 
+/// Redact an API key for logging: show only its last four characters, and
+/// nothing at all for short keys.
+fn redact_key(key: &str) -> String {
+    const VISIBLE: usize = 4;
+    let len = key.chars().count();
+    if len <= VISIBLE * 2 {
+        return "****".to_string();
+    }
+    let suffix: String = key.chars().skip(len - VISIBLE).collect();
+    format!("****{suffix}")
+}
+
+/// Send the authentication frame. The frame itself is never logged because
+/// it contains the API key and secret.
+async fn send_auth(credentials: &Credentials, sink: &mut WsSink) -> Result<()> {
+    // Alpaca uses {"action": "auth", "key": "...", "secret": "..."}
+    let auth_msg = serde_json::json!({
+        "action": "auth",
+        "key": credentials.api_key,
+        "secret": credentials.secret_key
+    });
+
+    let auth_json = serde_json::to_string(&auth_msg)?;
+    debug!(
+        "Sending auth message for key {}",
+        redact_key(&credentials.api_key)
+    );
+    sink.send(Message::Text(auth_json.into())).await?;
+    Ok(())
+}
+
+/// Extract the error message from a server frame, if the frame (or any
+/// element of a frame array) is a `{"T": "error"}` message.
+fn frame_error(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let frames = match &value {
+        serde_json::Value::Array(items) => items.as_slice(),
+        _ => std::slice::from_ref(&value),
+    };
+    frames.iter().find_map(|frame| {
+        if frame.get("T").and_then(|t| t.as_str()) == Some("error") {
+            return Some(
+                frame
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            );
+        }
+        // Trading-stream style: {"stream":"authorization","data":{"status":...}}
+        if frame.get("stream").and_then(|s| s.as_str()) == Some("authorization") {
+            let status = frame
+                .get("data")
+                .and_then(|d| d.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown");
+            if status != "authorized" {
+                return Some(format!("authorization status: {status}"));
+            }
+        }
+        None
+    })
+}
+
+/// Read the next text frame during the handshake, failing on error frames,
+/// unexpected frames, or a closed connection.
+async fn expect_ok_frame(stream: &mut WsReceiver, phase: &str) -> Result<()> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                debug!("{} response: {}", phase, text);
+                return match frame_error(&text) {
+                    Some(msg) => Err(AlpacaError::WebSocket(format!("{phase} failed: {msg}"))),
+                    None => Ok(()),
+                };
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(other)) => {
+                return Err(AlpacaError::WebSocket(format!(
+                    "{phase} failed: unexpected frame: {other:?}"
+                )));
+            }
+            Some(Err(e)) => return Err(e.into()),
+            None => {
+                return Err(AlpacaError::WebSocket(format!(
+                    "{phase} failed: connection closed"
+                )));
+            }
+        }
+    }
+}
+
+/// Connect, authenticate, and subscribe on a market-data socket, bounded by
+/// the configured connection timeout. Performs the full handshake (server
+/// hello, auth, subscription) so the returned stream only yields data frames.
+async fn open_market_data_stream(
+    url: &str,
+    credentials: &Credentials,
+    subscription: &SubscribeMessage,
+    config: &WebSocketConfig,
+) -> Result<WsReceiver> {
+    let handshake = async {
+        info!("Connecting to WebSocket: {}", url);
+        let (ws_stream, _) = connect_async(url).await?;
+        let (mut sink, mut stream) = ws_stream.split();
+
+        expect_ok_frame(&mut stream, "server hello").await?;
+
+        send_auth(credentials, &mut sink).await?;
+        expect_ok_frame(&mut stream, "authentication").await?;
+
+        // Alpaca uses {"action": "subscribe", ...}
+        let sub_msg = serde_json::json!({
+            "action": "subscribe",
+            "trades": subscription.trades.clone().unwrap_or_default(),
+            "quotes": subscription.quotes.clone().unwrap_or_default(),
+            "bars": subscription.bars.clone().unwrap_or_default()
+        });
+        let sub_json = serde_json::to_string(&sub_msg)?;
+        debug!("Sending subscription: {}", sub_json);
+        sink.send(Message::Text(sub_json.into())).await?;
+        expect_ok_frame(&mut stream, "subscription").await?;
+
+        Ok(stream)
+    };
+
+    match timeout(
+        Duration::from_millis(config.connection_timeout_ms),
+        handshake,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AlpacaError::WebSocket(format!(
+            "handshake timed out after {}ms",
+            config.connection_timeout_ms
+        ))),
+    }
+}
+
+/// Parse a market-data text frame (a JSON array of messages) into updates.
+fn parse_market_data_updates(text: &str) -> Vec<MarketDataUpdate> {
+    let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(text) else {
+        return Vec::new();
+    };
+    messages
+        .into_iter()
+        .filter_map(|msg_value| {
+            let msg_type = msg_value.get("T").and_then(|t| t.as_str())?;
+            match msg_type {
+                "t" => serde_json::from_value::<TradeMessage>(msg_value.clone())
+                    .ok()
+                    .map(|trade_msg| MarketDataUpdate::Trade {
+                        symbol: trade_msg.symbol.clone(),
+                        trade: trade_msg.into(),
+                    }),
+                // Quote message - try crypto format first
+                "q" => {
+                    if let Ok(quote_msg) =
+                        serde_json::from_value::<CryptoQuoteMessage>(msg_value.clone())
+                    {
+                        Some(MarketDataUpdate::Quote {
+                            symbol: quote_msg.symbol.clone(),
+                            quote: Quote {
+                                timestamp: quote_msg.timestamp,
+                                timeframe: "real-time".to_string(),
+                                bid_price: quote_msg.bid_price,
+                                bid_size: quote_msg.bid_size as u32,
+                                ask_price: quote_msg.ask_price,
+                                ask_size: quote_msg.ask_size as u32,
+                                bid_exchange: String::new(),
+                                ask_exchange: String::new(),
+                            },
+                        })
+                    } else {
+                        serde_json::from_value::<QuoteMessage>(msg_value)
+                            .ok()
+                            .map(|quote_msg| MarketDataUpdate::Quote {
+                                symbol: quote_msg.symbol.clone(),
+                                quote: quote_msg.into(),
+                            })
+                    }
+                }
+                "b" => serde_json::from_value::<BarMessage>(msg_value)
+                    .ok()
+                    .map(|bar_msg| MarketDataUpdate::Bar {
+                        symbol: bar_msg.symbol.clone(),
+                        bar: bar_msg.into(),
+                    }),
+                _ => {
+                    debug!("Ignoring message type: {}", msg_type);
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Connect and authenticate on a trading socket, bounded by the configured
+/// connection timeout. Unlike market data there is no server hello and no
+/// subscription frame: authentication is the whole handshake.
+async fn open_trading_stream(
+    url: &str,
+    credentials: &Credentials,
+    config: &WebSocketConfig,
+) -> Result<WsReceiver> {
+    let handshake = async {
+        info!("Connecting to WebSocket: {}", url);
+        let (ws_stream, _) = connect_async(url).await?;
+        let (mut sink, mut stream) = ws_stream.split();
+
+        send_auth(credentials, &mut sink).await?;
+        expect_ok_frame(&mut stream, "authentication").await?;
+
+        Ok(stream)
+    };
+
+    match timeout(
+        Duration::from_millis(config.connection_timeout_ms),
+        handshake,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AlpacaError::WebSocket(format!(
+            "handshake timed out after {}ms",
+            config.connection_timeout_ms
+        ))),
+    }
+}
+
+/// Parse a trading text frame (a single message or an array) into order
+/// updates, ignoring non-trade-update messages.
+fn parse_trading_updates(text: &str) -> Vec<TradeUpdateMessage> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let frames = match value {
+        serde_json::Value::Array(items) => items,
+        other => vec![other],
+    };
+    frames
+        .into_iter()
+        .filter_map(
+            |frame| match serde_json::from_value::<WebSocketMessage>(frame) {
+                Ok(WebSocketMessage::TradeUpdate(update)) => Some(*update),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// Lifecycle-event constructors shared by the market-data and trading
+/// streaming tasks.
+trait StreamEvents: Sized + Send + 'static {
+    fn lagged(missed: u64) -> Self;
+    fn reconnecting(attempt: u32, delay: Duration) -> Self;
+    fn reconnected() -> Self;
+    fn disconnected(reason: String) -> Self;
+}
+
+impl StreamEvents for MarketDataEvent {
+    fn lagged(missed: u64) -> Self {
+        Self::Lagged { missed }
+    }
+    fn reconnecting(attempt: u32, delay: Duration) -> Self {
+        Self::Reconnecting { attempt, delay }
+    }
+    fn reconnected() -> Self {
+        Self::Reconnected
+    }
+    fn disconnected(reason: String) -> Self {
+        Self::Disconnected { reason }
+    }
+}
+
+impl StreamEvents for TradingEvent {
+    fn lagged(missed: u64) -> Self {
+        Self::Lagged { missed }
+    }
+    fn reconnecting(attempt: u32, delay: Duration) -> Self {
+        Self::Reconnecting { attempt, delay }
+    }
+    fn reconnected() -> Self {
+        Self::Reconnected
+    }
+    fn disconnected(reason: String) -> Self {
+        Self::Disconnected { reason }
+    }
+}
+
+/// Forward a data update without blocking the socket reader. When the
+/// bounded channel is full the update is dropped and counted; the count is
+/// delivered later as a `Lagged` event. `Err(())` means the consumer
+/// dropped the stream.
+fn send_update<E: StreamEvents>(
+    sender: &mpsc::Sender<E>,
+    missed: &mut u64,
+    update: E,
+) -> std::result::Result<(), ()> {
+    if *missed > 0 {
+        match sender.try_send(E::lagged(*missed)) {
+            Ok(()) => *missed = 0,
+            Err(TrySendError::Full(_)) => {
+                *missed += 1;
+                return Ok(());
+            }
+            Err(TrySendError::Closed(_)) => return Err(()),
+        }
+    }
+    match sender.try_send(update) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            *missed += 1;
+            Ok(())
+        }
+        Err(TrySendError::Closed(_)) => Err(()),
+    }
+}
+
+/// Forward a lifecycle event, waiting for channel capacity so it is never
+/// dropped. Flushes any pending lag count first. Returns `false` when the
+/// consumer dropped the stream.
+async fn send_lifecycle<E: StreamEvents>(
+    sender: &mpsc::Sender<E>,
+    missed: &mut u64,
+    event: E,
+) -> bool {
+    if *missed > 0 {
+        if sender.send(E::lagged(*missed)).await.is_err() {
+            return false;
+        }
+        *missed = 0;
+    }
+    sender.send(event).await.is_ok()
+}
+
+/// Background task that owns a streaming socket: reads frames, forwards
+/// events to the consumer, and reconnects with capped exponential backoff
+/// by calling `open` (which re-runs the full handshake, so the active
+/// subscription/authentication is re-issued). Exits when the consumer
+/// drops the stream or reconnection gives up.
+async fn run_stream_task<E, O, Fut, P>(
+    mut stream: WsReceiver,
+    open: O,
+    parse: P,
+    config: WebSocketConfig,
+    sender: mpsc::Sender<E>,
+) where
+    E: StreamEvents,
+    O: Fn() -> Fut,
+    Fut: Future<Output = Result<WsReceiver>>,
+    P: Fn(&str) -> Vec<E>,
+{
+    let mut missed: u64 = 0;
+    'connection: loop {
+        let mut reason = loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    for update in parse(&text) {
+                        if send_update(&sender, &mut missed, update).is_err() {
+                            debug!("Stream dropped by consumer");
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) => break "server closed the connection".to_string(),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => break format!("websocket error: {e}"),
+                None => break "connection ended".to_string(),
+            }
+        };
+
+        if !config.reconnect_enabled {
+            let _ = send_lifecycle(&sender, &mut missed, E::disconnected(reason)).await;
+            return;
+        }
+
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            if attempt > config.reconnect_max_attempts {
+                error!(
+                    "Reconnection gave up after {} attempts",
+                    config.reconnect_max_attempts
+                );
+                let _ = send_lifecycle(
+                    &sender,
+                    &mut missed,
+                    E::disconnected(format!(
+                        "gave up after {} reconnect attempts: {}",
+                        config.reconnect_max_attempts, reason
+                    )),
+                )
+                .await;
+                return;
+            }
+
+            let delay = Duration::from_millis(
+                config
+                    .reconnect_base_delay_ms
+                    .saturating_mul(1u64 << (attempt - 1).min(16))
+                    .min(config.reconnect_max_delay_ms),
+            );
+            warn!(
+                "Connection lost ({}); reconnecting in {:?} (attempt {}/{})",
+                reason, delay, attempt, config.reconnect_max_attempts
+            );
+            if !send_lifecycle(&sender, &mut missed, E::reconnecting(attempt, delay)).await {
+                return;
+            }
+            sleep(delay).await;
+
+            match open().await {
+                Ok(new_stream) => {
+                    stream = new_stream;
+                    info!("Connection re-established");
+                    if !send_lifecycle(&sender, &mut missed, E::reconnected()).await {
+                        return;
+                    }
+                    continue 'connection;
+                }
+                Err(e) => {
+                    reason = format!("reconnect attempt {attempt} failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// WebSocket connection manager with automatic reconnection
 pub struct WebSocketManager {
     client: AlpacaWebSocketClient,
@@ -517,5 +928,101 @@ mod tests {
         let json = r#"{"T":"success","msg":"authenticated"}"#;
         let result = AlpacaWebSocketClient::parse_message(json);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_redact_key() {
+        assert_eq!(redact_key("PKABCDEFGHIJKLMNOP"), "****MNOP");
+        assert_eq!(redact_key("short"), "****");
+        assert_eq!(redact_key(""), "****");
+    }
+
+    #[test]
+    fn test_frame_error() {
+        assert_eq!(
+            frame_error(r#"[{"T":"error","code":402,"msg":"auth failed"}]"#),
+            Some("auth failed".to_string())
+        );
+        assert_eq!(
+            frame_error(r#"{"T":"error","code":405,"msg":"symbol limit exceeded"}"#),
+            Some("symbol limit exceeded".to_string())
+        );
+        assert_eq!(frame_error(r#"[{"T":"success","msg":"connected"}]"#), None);
+        assert_eq!(frame_error("not json"), None);
+        assert_eq!(
+            frame_error(r#"{"stream":"authorization","data":{"status":"unauthorized"}}"#),
+            Some("authorization status: unauthorized".to_string())
+        );
+        assert_eq!(
+            frame_error(r#"{"stream":"authorization","data":{"status":"authorized"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_trading_updates() {
+        let update = TradeUpdateMessage {
+            event: TradeUpdateEvent::Fill,
+            order: alpaca_base::test_utils::fixtures::sample_order(
+                "AAPL",
+                alpaca_base::types::OrderSide::Buy,
+                "10",
+            ),
+            timestamp: chrono::Utc::now(),
+            position_qty: None,
+            price: None,
+            qty: None,
+        };
+        let text = serde_json::to_string(&WebSocketMessage::TradeUpdate(Box::new(update))).unwrap();
+
+        let updates = parse_trading_updates(&text);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].order.symbol, "AAPL");
+        assert!(parse_trading_updates(r#"{"T":"success","msg":"connected"}"#).is_empty());
+        assert!(parse_trading_updates("not json").is_empty());
+    }
+
+    #[test]
+    fn test_parse_market_data_updates() {
+        let text = r#"[
+            {"T":"t","S":"AAPL","t":"2026-07-13T10:00:00Z","p":190.5,"s":100,"x":"V","c":[],"i":1},
+            {"T":"b","S":"AAPL","t":"2026-07-13T10:00:00Z","o":190.0,"h":191.0,"l":189.5,"c":190.5,"v":1000},
+            {"T":"subscription","trades":["AAPL"]}
+        ]"#;
+        let updates = parse_market_data_updates(text);
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(&updates[0], MarketDataUpdate::Trade { symbol, .. } if symbol == "AAPL"));
+        assert!(matches!(&updates[1], MarketDataUpdate::Bar { symbol, .. } if symbol == "AAPL"));
+        assert!(parse_market_data_updates("not json").is_empty());
+    }
+
+    #[test]
+    fn test_with_feed_urls() {
+        let cases = [
+            (DataFeed::Iex, "wss://stream.data.alpaca.markets/v2/iex"),
+            (DataFeed::Sip, "wss://stream.data.alpaca.markets/v2/sip"),
+            (
+                DataFeed::DelayedSip,
+                "wss://stream.data.alpaca.markets/v2/delayed_sip",
+            ),
+            (
+                DataFeed::Boats,
+                "wss://stream.data.alpaca.markets/v1beta1/boats",
+            ),
+            (
+                DataFeed::Overnight,
+                "wss://stream.data.alpaca.markets/v1beta1/overnight",
+            ),
+            (
+                DataFeed::Crypto,
+                "wss://stream.data.alpaca.markets/v1beta3/crypto/us",
+            ),
+        ];
+
+        for (feed, expected_url) in cases {
+            let credentials = Credentials::new("test_key".to_string(), "test_secret".to_string());
+            let client = AlpacaWebSocketClient::with_feed(credentials, Environment::Paper, feed);
+            assert_eq!(client.url(), expected_url);
+        }
     }
 }
